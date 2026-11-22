@@ -40,6 +40,8 @@
           border: 2px solid transparent; }
   .cell.backfill { background: #7bc47f; }
   .cell.business { background: #64b5f6; }
+  .cell.trial { background: #ba68c8; }
+  .cell.trialcommit { background: #6a1b9a; }
   .cell.susp { background: #ffd54f; }
   .cell.sel { border-color: #d32f2f; }
   .panel { background: #fff; border-radius: 8px; padding: 14px; flex: 1 1 320px;
@@ -71,18 +73,26 @@
     <div class="card"><div class="num" id="c-progress">-</div><div class="lbl">恢复进度</div></div>
     <div class="card"><div class="num" id="c-backfill">-</div><div class="lbl">回填状态</div></div>
     <div class="card"><div class="num" id="c-backup">-</div><div class="lbl">备份连接</div></div>
+    <div class="card"><div class="num" id="c-trial">-</div><div class="lbl">试写块</div></div>
     <div class="card"><div class="num" id="c-breads">-</div><div class="lbl">备份读取次数</div></div>
     <div class="card"><div class="num" id="c-bwrites">-</div><div class="lbl">业务写入次数</div></div>
     <div class="card"><div class="num" id="c-late">-</div><div class="lbl">迟到数据丢弃</div></div>
+    <div class="card"><div class="num" id="c-twrites">-</div><div class="lbl">试写写入次数</div></div>
+    <div class="card"><div class="num" id="c-tdone">-</div><div class="lbl">提交 / 放弃</div></div>
   </div>
   <div class="bar"><div id="bar-fill"></div></div>
 
   <div class="controls">
     <button id="btn-start">▶ 启动回填</button>
+    <button id="btn-trial-start" class="ghost">✎ 开始试写</button>
+    <button id="btn-trial-commit" class="warn">✔ 提交试写</button>
+    <button id="btn-trial-abort" class="ghost">✘ 放弃试写</button>
     <button id="btn-disconnect" class="warn">⛔ 断开备份</button>
     <button id="btn-reset" class="danger">↺ 重置卷</button>
     <span id="msg"></span>
   </div>
+  <div id="trial-banner" style="display:none;background:#f3e5f5;border:1px solid #ba68c8;
+       border-radius:8px;padding:8px 14px;margin-bottom:14px;font-size:13px;color:#4a148c;"></div>
 
   <div class="layout">
     <div class="grid-wrap">
@@ -90,6 +100,8 @@
         <span><i style="background:#d8dce3"></i>缺失</span>
         <span><i style="background:#7bc47f"></i>本地(回填)</span>
         <span><i style="background:#64b5f6"></i>本地(业务写入)</span>
+        <span><i style="background:#ba68c8"></i>试写(未并入原卷)</span>
+        <span><i style="background:#6a1b9a"></i>原卷(来源:试写提交)</span>
         <span><i style="background:#ffd54f"></i>已挂起备份读</span>
         <span>点击块进行选择</span>
       </div>
@@ -103,7 +115,7 @@
         <button id="btn-susp" class="warn">挂起备份读</button>
         <button id="btn-resume" class="ghost">放行备份读</button>
       </div>
-      <textarea id="wdata" placeholder="写入内容(UTF-8,≤ 4096 字节;不足补 0,凑成整块 4 KiB 落盘)"></textarea>
+      <textarea id="wdata" placeholder="写入内容(UTF-8,≤ 4096 字节;不足补 0,凑成整块 4 KiB;试写期间只写试写区)"></textarea>
       <div class="row" style="margin-top:8px">
         <button id="btn-write">整块写入</button>
       </div>
@@ -113,9 +125,9 @@
 
   <div class="demo">
     <h2>演示脚本</h2>
-    <p>一键演示:重置卷 → 挂起块 7 → 启动回填 → 挂起期间读块 7 被拒 / 整块写入成功 →
-       缺块时断开备份被拒 → 放行块 7 → 等待补齐 → 块 7 仍是业务数据(迟到备份数据未覆盖)→
-       断开备份 → 断开后读写正常。</p>
+    <p>一键演示:重置卷 → 开始试写 → 向缺块 7 试写(整块写入只记试写)→ 启动回填 →
+       试写期间读块 7 返回试写内容 → 缺块拒绝断开备份 → 等待原卷补齐(试写数据不算补齐)→
+       补齐后断开备份 → 读块 7 仍是试写内容 → 放弃试写 → 读回块 7 的备份数据。</p>
     <button id="btn-demo">▶ 运行演示</button>
     <button id="btn-clearlog" class="ghost">清空日志</button>
     <pre id="demolog">(演示日志)</pre>
@@ -124,7 +136,7 @@
 <script>
 const $ = s => document.querySelector(s);
 let selected = null;
-let lastStates = { present: {}, suspended: [] };
+let lastStates = { present: {}, suspended: [], trial: { open: false, blocks: [], round: null } };
 let blockCount = 256;
 
 async function api(path, method = "GET", body) {
@@ -149,9 +161,24 @@ async function refresh() {
   $("#c-progress").textContent = st.progress + "%";
   $("#c-backfill").textContent = st.backfill_complete ? "已完成" : (st.backfill_running ? "回填中" : "未运行");
   $("#c-backup").textContent = st.backup_disconnected ? "已断开" : "已连接";
+  $("#c-trial").textContent = st.trial.open ? `${st.trial.count} (轮 #${st.trial.round})` : "无";
+  const banner = $("#trial-banner");
+  if (st.trial.open) {
+    banner.style.display = "block";
+    const listed = st.trial.blocks.length ? st.trial.blocks.join(", ") : "尚无";
+    banner.textContent = `✎ 试写轮次 #${st.trial.round} 进行中:期间整块写入只记入试写区,不并入原卷;`
+      + `只有试写数据的块仍算缺块,不能断开备份。试写块(${st.trial.count}): ${listed}`;
+  } else {
+    banner.style.display = "none";
+  }
+  $("#btn-trial-start").disabled = st.trial.open;
+  $("#btn-trial-commit").disabled = !st.trial.open;
+  $("#btn-trial-abort").disabled = !st.trial.open;
   $("#c-breads").textContent = st.stats.backup_reads;
   $("#c-bwrites").textContent = st.stats.business_writes;
   $("#c-late").textContent = st.stats.late_ignored;
+  $("#c-twrites").textContent = st.stats.trial_writes;
+  $("#c-tdone").textContent = st.stats.trial_commits + " / " + st.stats.trial_aborts;
   $("#bar-fill").style.width = st.progress + "%";
   renderGrid();
   renderSelInfo();
@@ -160,9 +187,11 @@ async function refresh() {
 
 function cellClass(i) {
   if (lastStates.suspended.includes(i)) return "cell susp";
+  if (lastStates.trial.open && lastStates.trial.blocks.includes(i)) return "cell trial";
   const src = lastStates.present[i];
   if (src === "backfill") return "cell backfill";
   if (src === "business") return "cell business";
+  if (src === "trial") return "cell trialcommit";
   return "cell";
 }
 
@@ -186,9 +215,11 @@ function renderGrid() {
 function blockStateText(i) {
   const parts = [];
   const src = lastStates.present[i];
-  if (src === "backfill") parts.push('本地(来源:回填)');
-  else if (src === "business") parts.push('本地(来源:业务写入)');
-  else parts.push("缺失");
+  if (src === "backfill") parts.push('原卷已落盘(来源:回填)');
+  else if (src === "business") parts.push('原卷已落盘(来源:业务写入)');
+  else if (src === "trial") parts.push('原卷已落盘(来源:试写提交)');
+  else parts.push("原卷缺块");
+  if (lastStates.trial.open && lastStates.trial.blocks.includes(i)) parts.push("有试写(读取优先返回试写)");
   if (lastStates.suspended.includes(i)) parts.push("已挂起备份读");
   return parts.join(" · ");
 }
@@ -209,7 +240,20 @@ $("#btn-disconnect").onclick = async () => {
 $("#btn-reset").onclick = async () => {
   if (!confirm("重置将清空全部本地块,确定?")) return;
   const j = await api("/api/reset", "POST");
-  setMsg(j.message); refresh();
+  setMsg((j._status === 200 ? "✔ " : "✘ ") + j.message); refresh();
+};
+$("#btn-trial-start").onclick = async () => {
+  const j = await api("/api/trial/start", "POST");
+  setMsg((j._status === 200 ? "✔ " : "✘ ") + j.message); refresh();
+};
+$("#btn-trial-commit").onclick = async () => {
+  const j = await api("/api/trial/commit", "POST");
+  setMsg((j._status === 200 ? "✔ " : "✘ ") + j.message); refresh();
+};
+$("#btn-trial-abort").onclick = async () => {
+  if (!confirm("放弃试写将丢弃本轮试写改动(期间回填到原卷的数据保留),确定?")) return;
+  const j = await api("/api/trial/abort", "POST");
+  setMsg((j._status === 200 ? "✔ " : "✘ ") + j.message); refresh();
 };
 $("#btn-read").onclick = async () => {
   if (selected === null) return;
@@ -256,38 +300,54 @@ $("#btn-demo").onclick = async () => {
   btn.disabled = true;
   const B = 7;
   try {
-    slog("=== 演示开始 ===");
+    slog("=== 试写演示开始 ===");
     let j = await api("/api/reset", "POST");
-    slog("0. " + j.message);
+    slog("0. 重置卷 → " + j.message);
+    j = await api("/api/trial/start", "POST");
+    slog("1. 开始试写 → " + j.message);
+
+    const payload = `TRIAL-WRITE block ${B} @ ${new Date().toLocaleTimeString()}`;
+    let r = await api(`/api/block/${B}/write`, "POST", { data: payload });
+    slog(`2. 向缺块 ${B} 整块写入 → HTTP ${r._status} 写入类型=${r.written} ✔(只记为试写,未并入原卷)`);
+    r = await api(`/api/block/${B}`);
+    slog(`3. 读块 ${B} → 来源=${r.source}/${r.origin} 内容="${r.text}" ✔(优先返回试写)`);
+    let st = await refresh();
+    slog(`   状态:原卷已落盘=${st.present} 缺块=${st.missing} 试写块=[${st.trial.blocks.join(",")}]`
+       + ` ✔(只有试写数据的块仍算缺块)`);
+
     j = await api(`/api/block/${B}/suspend`, "POST");
-    slog(`1. 挂起块 ${B} 的后台备份读取 → ${j.message}`);
+    slog(`4. 挂起块 ${B} 的原卷回填 → ${j.message}(只为让"仅试写"状态停留一会儿)`);
     j = await api("/api/backfill/start", "POST");
-    slog("2. 启动后台回填 → " + j.message);
-    let r = await api(`/api/block/${B}`);
-    slog(`3. 挂起期间读块 ${B} → HTTP ${r._status}: ${r.message} ✔(缺块且挂起,不读备份)`);
-    const payload = `BUSINESS-WRITE block ${B} @ ${new Date().toLocaleTimeString()}`;
-    r = await api(`/api/block/${B}/write`, "POST", { data: payload });
-    slog(`4. 挂起期间对块 ${B} 提交整块写入 → HTTP ${r._status} ✔`);
-    r = await api(`/api/block/${B}`);
-    slog(`5. 读块 ${B} → 来源=${r.source}/${r.origin} 内容="${r.text}" ✔`);
+    slog("5. 启动后台回填原卷 → " + j.message);
+    const onlyTrial = await waitUntil(s => s.missing === 1, 60000);
+    slog(onlyTrial
+      ? `6. 其余块全部回填,缺块仍为 1(块 ${B} 只有试写数据)→ 试写数据不算补齐 ✔`
+      : "✘ 等待回填超时");
+    if (!onlyTrial) return;
     r = await api("/api/disconnect", "POST");
-    slog(`6. 缺块未补齐,尝试断开备份 → HTTP ${r._status}: ${r.message} ✔(被拒绝)`);
+    slog(`7. 仅剩试写数据的缺块时断开备份 → HTTP ${r._status}: ${r.message} ✔(被拒绝)`);
+    r = await api("/api/trial/start", "POST");
+    slog(`   说明:一次只开一轮,重复开始 → HTTP ${r._status}: ${r.message} ✔`);
+    r = await api("/api/reset", "POST");
+    slog(`   说明:试写期间重置卷 → HTTP ${r._status}: ${r.message} ✔`);
+
     j = await api(`/api/block/${B}/resume`, "POST");
-    slog(`7. 放行块 ${B} → ${j.message}`);
-    slog("8. 等待回填完成 ...");
-    const done = await waitUntil(st => st.missing === 0, 60000);
+    slog(`8. 放行块 ${B} 的原卷回填 → ${j.message}`);
+    slog("9. 等待原卷补齐 ...");
+    const done = await waitUntil(s => s.missing === 0, 60000);
     if (!done) { slog("✘ 等待回填超时"); return; }
-    slog("   回填完成,无缺块");
+    slog("   原卷补齐完成(原卷里已有块 " + B + " 的备份数据,但读取仍优先试写)");
+
     r = await api(`/api/block/${B}`);
-    slog(`9. 补齐后块 ${B} 仍是业务数据:"${r.text}" ✔(迟到的备份数据未覆盖)`);
+    slog(`10. 补齐后读块 ${B} → 来源=${r.source}/${r.origin} 内容="${r.text}" ✔(仍是试写内容)`);
     r = await api("/api/disconnect", "POST");
-    slog(`10. 补齐后断开备份 → HTTP ${r._status}: ${r.message} ✔`);
-    r = await api("/api/block/3");
-    slog(`11. 断开后读块 3 → 来源=${r.source} 内容="${r.text}" ✔`);
-    r = await api("/api/block/3/write", "POST", { data: "POST-DISCONNECT-WRITE" });
-    r = await api("/api/block/3");
-    slog(`12. 断开后改写块 3 再读 → "${r.text}" ✔ 数据盘仍可读写`);
-    slog("=== 演示完成 ===");
+    slog(`11. 原卷补齐后断开备份 → HTTP ${r._status}: ${r.message} ✔`);
+
+    r = await api("/api/trial/abort", "POST");
+    slog(`12. 放弃试写 → HTTP ${r._status}: ${r.message} ✔(只丢弃试写,期间回填保留)`);
+    r = await api(`/api/block/${B}`);
+    slog(`13. 放弃后读回块 ${B} → 来源=${r.source}/${r.origin} 内容="${r.text.slice(0, 40)}" ✔(读回该块的备份数据)`);
+    slog("=== 试写演示完成 ===");
   } catch (e) {
     slog("✘ 演示异常: " + e);
   } finally {

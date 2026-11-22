@@ -9,6 +9,10 @@
 - 网页可按块挂起/放行后台备份读取;挂起期间同一块的整块写入照常提交;
 - 进程重启后保留已落盘的块,并自动继续回填;
 - 只要还有缺块就拒绝断开备份;补齐后允许断开,断开后数据盘纯本地读写。
+- 试写:一次只开一轮;试写期间整块写入只记入试写区(每块最多一份额外副本),
+  读块优先返回本轮最近一次试写内容;后台回填只补原卷,只有试写数据的块仍算缺块;
+  提交时单事务并入原卷,放弃时只丢试写(保留期间回填);失败整体回滚;重启后续用;
+  试写期间拒绝重置卷。
 """
 from __future__ import annotations
 
@@ -40,6 +44,23 @@ CREATE TABLE IF NOT EXISTS meta(
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+-- 试写轮次:同一时刻最多只有一个 open 轮次(部分唯一索引保证)
+CREATE TABLE IF NOT EXISTS trial_round(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  state      TEXT NOT NULL,          -- open | committed | aborted
+  started_at REAL NOT NULL,
+  ended_at   REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS trial_one_open
+  ON trial_round(state) WHERE state='open';
+-- 试写块:每轮每个块最多保留一行(最近一次试写内容),不触碰原卷 blocks
+CREATE TABLE IF NOT EXISTS trial_blocks(
+  round_id   INTEGER NOT NULL,
+  idx        INTEGER NOT NULL,
+  data       BLOB NOT NULL,
+  updated_at REAL NOT NULL,
+  PRIMARY KEY(round_id, idx)
+);
 """
 
 
@@ -64,7 +85,10 @@ class Volume:
         self._worker = None
         self._stop = threading.Event()
         self.generation = 0  # reset/stop 时 +1,旧 worker 发现世代变更即退出
-        self.stats = {"backup_reads": 0, "backfilled": 0, "business_writes": 0, "late_ignored": 0}
+        self.stats = {
+            "backup_reads": 0, "backfilled": 0, "business_writes": 0, "late_ignored": 0,
+            "trial_writes": 0, "trial_commits": 0, "trial_aborts": 0,
+        }
 
     # ---------- 元数据 ----------
     def meta_get(self, key, default="0"):
@@ -134,8 +158,16 @@ class Volume:
 
     # ---------- 业务读写 ----------
     def read_block(self, idx):
-        """返回 (status, data, origin)。status: local|backup|suspended|gone"""
+        """返回 (status, data, origin)。status: local|trial|backup|suspended|gone"""
         with self.lock:
+            row = self.open_trial_locked()
+            if row is not None:
+                trial = self.db.execute(
+                    "SELECT data FROM trial_blocks WHERE round_id=? AND idx=?",
+                    (row[0], idx),
+                ).fetchone()
+                if trial is not None:
+                    return "trial", trial[0], "trial"
             row = self.db.execute("SELECT data, source FROM blocks WHERE idx=?", (idx,)).fetchone()
             if row:
                 return "local", row[0], row[1]
@@ -147,9 +179,11 @@ class Volume:
         return "backup", self.read_backup(idx), None
 
     def write_block(self, idx, data):
-        """整块写入(必须恰好 block_size 字节),业务写入永远生效。"""
+        """整块写入(必须恰好 block_size 字节)。试写期间整块写入都只记为试写。"""
         assert len(data) == self.block_size
         with self.lock:
+            if self.trial_write_locked(idx, data) is not None:
+                return "trial"
             self.db.execute(
                 "INSERT INTO blocks(idx,data,source,updated_at) VALUES(?,?,?,?) "
                 "ON CONFLICT(idx) DO UPDATE SET data=excluded.data, "
@@ -158,6 +192,129 @@ class Volume:
             )
             self.db.commit()
             self.stats["business_writes"] += 1
+            return "business"
+
+    # ---------- 试写轮次 ----------
+    # 试写数据独立存放(不触碰 blocks),因此:
+    #   * 读块优先返回本轮最近一次试写内容;
+    #   * 后台回填只补原卷,试写块在原卷里仍算缺块,断开备份仍被拒绝;
+    #   * 放弃只删试写行,期间回填到原卷的数据保留;
+    #   * 提交/放弃用单事务,任一失败则整体回滚,原卷和本轮试写都保持原状。
+    def open_trial_locked(self):
+        return self.db.execute(
+            "SELECT id, started_at FROM trial_round WHERE state='open'"
+        ).fetchone()
+
+    def trial_map_locked(self, round_id):
+        return {
+            r[0]: r[1]
+            for r in self.db.execute(
+                "SELECT idx, data FROM trial_blocks WHERE round_id=? ORDER BY idx", (round_id,)
+            )
+        }
+
+    def trial_info(self):
+        with self.lock:
+            row = self.open_trial_locked()
+            if row is None:
+                (last,) = self.db.execute(
+                    "SELECT COUNT(*) FROM trial_round WHERE state!='open'"
+                ).fetchone()
+                return {"open": False, "round": None, "started_at": None,
+                        "blocks": [], "count": 0, "finished_rounds": last}
+            round_id, started_at = row
+            blocks = self.trial_map_locked(round_id)
+            return {
+                "open": True,
+                "round": round_id,
+                "started_at": started_at,
+                "blocks": sorted(blocks),
+                "count": len(blocks),
+            }
+
+    def start_trial(self):
+        with self.lock:
+            row = self.open_trial_locked()
+            if row is not None:
+                return False, f"已有试写轮次 #{row[0]} 进行中,一次只允许一轮"
+            try:
+                cur = self.db.execute(
+                    "INSERT INTO trial_round(state, started_at) VALUES('open', ?)", (time.time(),)
+                )
+                self.db.commit()
+            except sqlite3.IntegrityError:
+                # 部分唯一索引兜底(例如另一个进程抢先开启)
+                self.db.rollback()
+                return False, "已有试写轮次进行中,一次只允许一轮"
+            return True, f"试写轮次 #{cur.lastrowid} 已开始;期间的整块写入只记为试写"
+
+    def trial_write_locked(self, idx, data):
+        row = self.open_trial_locked()
+        if row is None:
+            return None
+        round_id = row[0]
+        # 每轮每块一行:同一块的再次试写覆盖上一份,不额外保留
+        self.db.execute(
+            "INSERT INTO trial_blocks(round_id, idx, data, updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(round_id, idx) DO UPDATE SET "
+            "data=excluded.data, updated_at=excluded.updated_at",
+            (round_id, idx, data, time.time()),
+        )
+        self.db.commit()
+        self.stats["trial_writes"] += 1
+        return round_id
+
+    def _finish_trial_locked(self, round_id, state):
+        """结束一轮试写:提交=并入原卷,放弃=丢弃试写。整段单事务。"""
+        try:
+            if state == "committed":
+                blocks = self.trial_map_locked(round_id)
+                now = time.time()
+                for idx in sorted(blocks):
+                    self.db.execute(
+                        "INSERT INTO blocks(idx,data,source,updated_at) VALUES(?,?,?,?) "
+                        "ON CONFLICT(idx) DO UPDATE SET data=excluded.data, "
+                        "source=excluded.source, updated_at=excluded.updated_at",
+                        (idx, blocks[idx], "trial", now),
+                    )
+            # 无论提交还是放弃,试写副本都不再需要
+            self.db.execute("DELETE FROM trial_blocks WHERE round_id=?", (round_id,))
+            self.db.execute(
+                "UPDATE trial_round SET state=?, ended_at=? WHERE id=?",
+                (state, time.time(), round_id),
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()  # 原卷 blocks / trial_blocks / trial_round 全部回到本轮开始前
+            raise
+
+    def commit_trial(self):
+        with self.lock:
+            row = self.open_trial_locked()
+            if row is None:
+                return False, "当前没有进行中的试写轮次"
+            round_id = row[0]
+            try:
+                self._finish_trial_locked(round_id, "committed")
+            except Exception as exc:
+                log.exception("试写提交失败,已回滚 (round=%d)", round_id)
+                return False, f"试写提交失败,原卷与试写均未改变: {exc}"
+            self.stats["trial_commits"] += 1
+            return True, f"试写轮次 #{round_id} 已并入原卷"
+
+    def abort_trial(self):
+        with self.lock:
+            row = self.open_trial_locked()
+            if row is None:
+                return False, "当前没有进行中的试写轮次"
+            round_id = row[0]
+            try:
+                self._finish_trial_locked(round_id, "aborted")
+            except Exception as exc:
+                log.exception("试写放弃失败,已回滚 (round=%d)", round_id)
+                return False, f"放弃试写失败,原卷与试写均未改变: {exc}"
+            self.stats["trial_aborts"] += 1
+            return True, f"试写轮次 #{round_id} 已放弃;期间回填到原卷的数据保留"
 
     # ---------- 后台回填 ----------
     def _backfill_loop(self, generation):
@@ -263,8 +420,11 @@ class Volume:
             self._stop.clear()
 
     def reset(self):
-        """清空本地卷(演示用):已落盘块、挂起表、断开标记全部复位。"""
+        """清空本地卷(演示用):已落盘块、挂起表、断开标记、试写轮次全部复位。"""
         with self.lock:
+            row = self.open_trial_locked()
+            if row is not None:
+                return False, f"试写轮次 #{row[0]} 进行中,拒绝重置卷;请先提交或放弃试写"
             self.generation += 1
             self._stop.set()
             self.meta_set("backfill_running", "0")
@@ -272,11 +432,14 @@ class Volume:
         with self.lock:
             self.db.execute("DELETE FROM blocks")
             self.db.execute("DELETE FROM suspended")
+            self.db.execute("DELETE FROM trial_blocks")
+            self.db.execute("DELETE FROM trial_round")
             self.meta_set("backup_disconnected", "0")
             self.db.commit()
             for k in self.stats:
                 self.stats[k] = 0
             self._stop.clear()
+            return True, "本地卷已重置(全部缺块,备份恢复连接)"
 
     # ---------- 断开备份 ----------
     def disconnect(self):
@@ -297,6 +460,7 @@ class Volume:
     def status(self):
         with self.lock:
             (present,) = self.db.execute("SELECT COUNT(*) FROM blocks").fetchone()
+            trial = self.trial_info()
             return {
                 "block_size": self.block_size,
                 "block_count": self.block_count,
@@ -307,6 +471,7 @@ class Volume:
                 "backfill_complete": present == self.block_count,
                 "backup_disconnected": self.meta_get("backup_disconnected") == "1",
                 "suspended": self.suspended_list(),
+                "trial": trial,
                 "stats": dict(self.stats),
             }
 
@@ -369,7 +534,11 @@ def create_app(config=None):
 
     @app.get("/api/blocks")
     def api_blocks():
-        return jsonify(present=vol.present_map(), suspended=vol.suspended_list())
+        return jsonify(
+            present=vol.present_map(),
+            suspended=vol.suspended_list(),
+            trial=vol.trial_info(),
+        )
 
     # ---------- 块读写 ----------
     @app.get("/api/block/<int:idx>")
@@ -377,6 +546,9 @@ def create_app(config=None):
         if not check_idx(idx):
             return err("块号越界", 404)
         status, data, origin = vol.read_block(idx)
+        if status == "trial":
+            return jsonify(ok=True, idx=idx, source="trial", origin="trial",
+                           text=_preview_text(data), size=len(data))
         if status == "local":
             return jsonify(ok=True, idx=idx, source="local", origin=origin,
                            text=_preview_text(data), size=len(data))
@@ -398,8 +570,32 @@ def create_app(config=None):
         raw = str(text).encode("utf-8")
         if len(raw) > vol.block_size:
             return err(f"数据 {len(raw)} 字节,超过整块大小 {vol.block_size} 字节", 400)
-        vol.write_block(idx, raw.ljust(vol.block_size, b"\x00"))
-        return jsonify(ok=True, message=f"块 {idx} 已整块写入本地({vol.block_size} 字节)")
+        kind = vol.write_block(idx, raw.ljust(vol.block_size, b"\x00"))
+        if kind == "trial":
+            return jsonify(ok=True, written="trial",
+                           message=f"块 {idx} 已整块写入试写区({vol.block_size} 字节),未并入原卷")
+        return jsonify(ok=True, written="business",
+                       message=f"块 {idx} 已整块写入本地({vol.block_size} 字节)")
+
+    # ---------- 试写 ----------
+    @app.post("/api/trial/start")
+    def api_trial_start():
+        ok, msg = vol.start_trial()
+        return jsonify(ok=ok, message=msg, trial=vol.trial_info()), (200 if ok else 409)
+
+    @app.post("/api/trial/commit")
+    def api_trial_commit():
+        ok, msg = vol.commit_trial()
+        return jsonify(ok=ok, message=msg, trial=vol.trial_info()), (200 if ok else 409)
+
+    @app.post("/api/trial/abort")
+    def api_trial_abort():
+        ok, msg = vol.abort_trial()
+        return jsonify(ok=ok, message=msg, trial=vol.trial_info()), (200 if ok else 409)
+
+    @app.get("/api/trial")
+    def api_trial():
+        return jsonify(ok=True, trial=vol.trial_info())
 
     # ---------- 挂起 / 放行 ----------
     @app.post("/api/block/<int:idx>/suspend")
@@ -429,8 +625,8 @@ def create_app(config=None):
 
     @app.post("/api/reset")
     def api_reset():
-        vol.reset()
-        return jsonify(ok=True, message="本地卷已重置(全部缺块,备份恢复连接)")
+        ok, msg = vol.reset()
+        return jsonify(ok=ok, message=msg), (200 if ok else 409)
 
     return app
 
